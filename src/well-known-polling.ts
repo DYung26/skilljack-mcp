@@ -6,7 +6,9 @@
  * shape as github-polling.ts so the wiring in index.ts is symmetrical.
  */
 
+import * as path from "node:path";
 import { WellKnownSpec } from "./well-known-config.js";
+import { tryAcquireFileLockSync } from "./file-lock.js";
 import { SyncOptions, SyncResult, hasRemoteUpdates, syncWellKnown } from "./well-known-sync.js";
 
 export interface PollingOptions {
@@ -37,29 +39,42 @@ export function createWellKnownPollingManager(
     }
     if (specs.length === 0) return;
 
-    isChecking = true;
-    console.error(`Well-known polling: checking ${specs.length} publisher(s) for updates...`);
-
-    for (const spec of specs) {
-      try {
-        const hasUpdates = await hasRemoteUpdates(spec, syncOptions);
-        if (!hasUpdates) continue;
-
-        console.error(`Well-known polling: updates available for ${spec.origin}`);
-        const result = await syncWellKnown(spec, syncOptions);
-        if (!result.error && result.updated) {
-          pollingOptions.onUpdate(spec, result);
-        }
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        console.error(
-          `Well-known polling: error checking ${spec.origin}: ${err.message}`
-        );
-        pollingOptions.onError?.(spec, err);
-      }
+    // One process polls a given Skilljack cache at a time. This lease is
+    // separate from GitHub polling so both source types make progress.
+    const release = tryAcquireFileLockSync(
+      path.join(syncOptions.cacheDir, ".skilljack-well-known-polling.lock"),
+    );
+    if (!release) {
+      console.error("Well-known polling: another Skilljack process owns the polling lease; skipping");
+      return;
     }
 
-    isChecking = false;
+    isChecking = true;
+    try {
+      console.error(`Well-known polling: checking ${specs.length} publisher(s) for updates...`);
+
+      for (const spec of specs) {
+        try {
+          const hasUpdates = await hasRemoteUpdates(spec, syncOptions);
+          if (!hasUpdates) continue;
+
+          console.error(`Well-known polling: updates available for ${spec.origin}`);
+          const result = await syncWellKnown(spec, syncOptions);
+          if (!result.error && result.updated) {
+            pollingOptions.onUpdate(spec, result);
+          }
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          console.error(
+            `Well-known polling: error checking ${spec.origin}: ${err.message}`
+          );
+          pollingOptions.onError?.(spec, err);
+        }
+      }
+    } finally {
+      isChecking = false;
+      release();
+    }
   }
 
   return {

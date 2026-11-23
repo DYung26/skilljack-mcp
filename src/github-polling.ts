@@ -3,7 +3,9 @@
  * Periodically checks for changes and triggers sync when updates are available.
  */
 
+import * as path from "node:path";
 import { GitHubRepoSpec } from "./github-config.js";
+import { tryAcquireFileLockSync } from "./file-lock.js";
 import { SyncOptions, SyncResult, syncRepo, hasRemoteUpdates } from "./github-sync.js";
 
 /**
@@ -69,37 +71,49 @@ export function createPollingManager(
       return;
     }
 
-    isChecking = true;
     const polledSpecs = getPolledSpecs();
-
     if (polledSpecs.length === 0) {
       console.error("Polling: No repositories to poll (all pinned to specific refs)");
-      isChecking = false;
       return;
     }
 
-    console.error(`Polling: Checking ${polledSpecs.length} repo(s) for updates...`);
-
-    for (const spec of polledSpecs) {
-      try {
-        const hasUpdates = await hasRemoteUpdates(spec, syncOptions);
-
-        if (hasUpdates) {
-          console.error(`Polling: Updates available for ${spec.owner}/${spec.repo}`);
-          const result = await syncRepo(spec, syncOptions);
-
-          if (!result.error && result.updated) {
-            pollingOptions.onUpdate(spec, result);
-          }
-        }
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        console.error(`Polling: Error checking ${spec.owner}/${spec.repo}: ${err.message}`);
-        pollingOptions.onError?.(spec, err);
-      }
+    // One process polls a given Skilljack cache at a time. Other processes
+    // continue serving their cached skills without duplicating remote traffic.
+    const release = tryAcquireFileLockSync(
+      path.join(syncOptions.cacheDir, ".skilljack-github-polling.lock"),
+    );
+    if (!release) {
+      console.error("Polling: Another Skilljack process owns the GitHub polling lease; skipping");
+      return;
     }
 
-    isChecking = false;
+    isChecking = true;
+    try {
+      console.error(`Polling: Checking ${polledSpecs.length} repo(s) for updates...`);
+
+      for (const spec of polledSpecs) {
+        try {
+          const hasUpdates = await hasRemoteUpdates(spec, syncOptions);
+
+          if (hasUpdates) {
+            console.error(`Polling: Updates available for ${spec.owner}/${spec.repo}`);
+            const result = await syncRepo(spec, syncOptions);
+
+            if (!result.error && result.updated) {
+              pollingOptions.onUpdate(spec, result);
+            }
+          }
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          console.error(`Polling: Error checking ${spec.owner}/${spec.repo}: ${err.message}`);
+          pollingOptions.onError?.(spec, err);
+        }
+      }
+    } finally {
+      // A throwing callback or unexpected failure must never wedge polling.
+      isChecking = false;
+      release();
+    }
   }
 
   return {

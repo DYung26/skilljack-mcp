@@ -13,6 +13,10 @@ const mockGitInstance = {
   tags: vi.fn().mockResolvedValue({ all: [] }),
 };
 
+vi.mock("./file-lock.js", () => ({
+  withFileLock: async (_lockPath: string, operation: () => Promise<unknown>) => operation(),
+}));
+
 vi.mock("simple-git", () => ({
   simpleGit: vi.fn(() => mockGitInstance),
 }));
@@ -50,6 +54,17 @@ describe("syncRepo", () => {
       expect.any(String),
       expect.arrayContaining(["--depth", "1"])
     );
+  });
+
+  it("reuses an existing cache during startup without pulling", async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith(".git"));
+
+    const result = await syncRepo(spec, { ...options, skipIfExists: true });
+
+    expect(result.updated).toBe(false);
+    expect(result.error).toBeUndefined();
+    expect(mockGitInstance.clone).not.toHaveBeenCalled();
+    expect(mockGitInstance.pull).not.toHaveBeenCalled();
   });
 
   it("pulls when repo already exists", async () => {

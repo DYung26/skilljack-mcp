@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { simpleGit, SimpleGit, TagResult } from "simple-git";
 import { GitHubRepoSpec, getRepoClonePath, getRepoCachePath } from "./github-config.js";
+import { withFileLock } from "./file-lock.js";
 
 /**
  * Options for syncing GitHub repositories.
@@ -15,6 +16,8 @@ export interface SyncOptions {
   cacheDir: string;
   token?: string;
   shallowClone?: boolean; // Default: true
+  /** Skip network work when a valid cache already exists (startup only). */
+  skipIfExists?: boolean;
 }
 
 /**
@@ -152,7 +155,7 @@ async function pullWithRetry(git: SimpleGit, ref: string | undefined): Promise<b
  * @param options - Sync options
  * @returns Sync result
  */
-export async function syncRepo(spec: GitHubRepoSpec, options: SyncOptions): Promise<SyncResult> {
+async function syncRepoUnlocked(spec: GitHubRepoSpec, options: SyncOptions): Promise<SyncResult> {
   const clonePath = getRepoClonePath(spec, options.cacheDir);
   const localPath = getRepoCachePath(spec, options.cacheDir);
   const shallowClone = options.shallowClone !== false; // Default true
@@ -163,6 +166,13 @@ export async function syncRepo(spec: GitHubRepoSpec, options: SyncOptions): Prom
     clonePath,
     updated: false,
   };
+
+  if (options.skipIfExists && isGitRepo(clonePath)) {
+    if (spec.subpath && !fs.existsSync(localPath)) {
+      result.error = `Subpath "${spec.subpath}" not found in repository`;
+    }
+    return result;
+  }
 
   try {
     const url = buildRepoUrl(spec, options.token);
@@ -229,6 +239,20 @@ export async function syncRepo(spec: GitHubRepoSpec, options: SyncOptions): Prom
 }
 
 /**
+ * Sync a repository while holding its cache lock so concurrent Skilljack
+ * processes cannot clone, fetch, or pull the same working tree at once.
+ */
+export async function syncRepo(
+  spec: GitHubRepoSpec,
+  options: SyncOptions,
+): Promise<SyncResult> {
+  const clonePath = getRepoClonePath(spec, options.cacheDir);
+  return withFileLock(`${clonePath}.skilljack-lock`, () =>
+    syncRepoUnlocked(spec, options),
+  );
+}
+
+/**
  * Sync multiple GitHub repositories.
  *
  * @param specs - Repository specifications
@@ -257,9 +281,9 @@ export async function syncAllRepos(
  * @param options - Sync options
  * @returns true if updates are available
  */
-export async function hasRemoteUpdates(
+async function hasRemoteUpdatesUnlocked(
   spec: GitHubRepoSpec,
-  options: SyncOptions
+  options: SyncOptions,
 ): Promise<boolean> {
   const clonePath = getRepoClonePath(spec, options.cacheDir);
 
@@ -312,4 +336,15 @@ export async function hasRemoteUpdates(
     console.error(`Failed to check for updates: ${error}`);
     return false;
   }
+}
+
+/** Serialize fetches with clone/pull operations for this repository. */
+export async function hasRemoteUpdates(
+  spec: GitHubRepoSpec,
+  options: SyncOptions,
+): Promise<boolean> {
+  const clonePath = getRepoClonePath(spec, options.cacheDir);
+  return withFileLock(`${clonePath}.skilljack-lock`, () =>
+    hasRemoteUpdatesUnlocked(spec, options),
+  );
 }

@@ -1,4 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+vi.mock("./file-lock.js", () => ({
+  withFileLock: async (_lockPath: string, operation: () => Promise<unknown>) => operation(),
+}));
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -287,6 +291,23 @@ describe("syncWellKnown", () => {
 
     // Cached index.json is written after a successful sync.
     expect(fs.existsSync(getWellKnownIndexPath(spec, cacheDir))).toBe(true);
+  });
+
+  it("reuses a complete cache during startup without fetching", async () => {
+    const body = makeSkillMd("demo", "A demo skill.");
+    const { url, digest } = setSkillMd("demo", body);
+    setIndex([
+      { name: "demo", type: "skill-md", description: "demo", url, digest },
+    ]);
+
+    await syncWellKnown(spec, options);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const result = await syncWellKnown(spec, { ...options, skipIfExists: true });
+
+    expect(result.error).toBeUndefined();
+    expect(result.updated).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("rejects an entry whose digest does not match the artifact", async () => {

@@ -24,6 +24,7 @@ import {
   getWellKnownSkillPath,
   resolveArtifactUrl,
 } from "./well-known-config.js";
+import { withFileLock } from "./file-lock.js";
 
 /**
  * One entry in the publisher's discovery index.
@@ -59,6 +60,8 @@ export interface SyncOptions {
   allowedOrigins: string[];
   /** Permit http:// (dev only); otherwise only https:// is fetched. */
   allowHttp: boolean;
+  /** Skip network work when a valid cached index already exists (startup only). */
+  skipIfExists?: boolean;
 }
 
 /**
@@ -534,9 +537,9 @@ function loadCachedIndex(spec: WellKnownSpec, cacheDir: string): IndexDocument |
  *   4. Prune skill subdirectories that are no longer in the index.
  *   5. Atomically replace the cached index.json.
  */
-export async function syncWellKnown(
+async function syncWellKnownUnlocked(
   spec: WellKnownSpec,
-  options: SyncOptions
+  options: SyncOptions,
 ): Promise<SyncResult> {
   const cachePath = getWellKnownCachePath(spec, options.cacheDir);
   const skillsRoot = path.join(cachePath, "skills");
@@ -551,6 +554,16 @@ export async function syncWellKnown(
 
   ensureDir(cachePath);
   ensureDir(skillsRoot);
+
+  if (options.skipIfExists) {
+    const cachedIndex = loadCachedIndex(spec, options.cacheDir);
+    const cacheIsComplete = cachedIndex?.skills.every((entry) =>
+      fs.existsSync(path.join(getWellKnownSkillPath(spec, entry.name, options.cacheDir), "SKILL.md")),
+    );
+    if (cachedIndex && cacheIsComplete) {
+      return result;
+    }
+  }
 
   // Re-validate every URL we fetch (index, artifacts, redirect targets) against
   // the allowlist and scheme rules — not just the configured index origin.
@@ -684,6 +697,20 @@ export async function syncWellKnown(
 }
 
 /**
+ * Sync one publisher while holding its cache lock. This protects the index,
+ * metadata, and skill directories from concurrent process writes.
+ */
+export async function syncWellKnown(
+  spec: WellKnownSpec,
+  options: SyncOptions,
+): Promise<SyncResult> {
+  const cachePath = getWellKnownCachePath(spec, options.cacheDir);
+  return withFileLock(`${cachePath}.skilljack-lock`, () =>
+    syncWellKnownUnlocked(spec, options),
+  );
+}
+
+/**
  * Sync multiple publishers sequentially.
  */
 export async function syncAllWellKnown(
@@ -707,9 +734,9 @@ export async function syncAllWellKnown(
  *
  * This avoids hashing on the publisher's side and keeps bandwidth low.
  */
-export async function hasRemoteUpdates(
+async function hasRemoteUpdatesUnlocked(
   spec: WellKnownSpec,
-  options: SyncOptions
+  options: SyncOptions,
 ): Promise<boolean> {
   const metaPath = getWellKnownMetaPath(spec, options.cacheDir);
   if (!fs.existsSync(metaPath)) return true;
@@ -747,4 +774,15 @@ export async function hasRemoteUpdates(
     );
     return false;
   }
+}
+
+/** Serialize update checks with syncs for this publisher. */
+export async function hasRemoteUpdates(
+  spec: WellKnownSpec,
+  options: SyncOptions,
+): Promise<boolean> {
+  const cachePath = getWellKnownCachePath(spec, options.cacheDir);
+  return withFileLock(`${cachePath}.skilljack-lock`, () =>
+    hasRemoteUpdatesUnlocked(spec, options),
+  );
 }
