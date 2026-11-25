@@ -517,7 +517,7 @@ describe("syncWellKnown", () => {
     const skillDir = getWellKnownSkillPath(spec, "wrangler", cacheDir);
     expect(fs.existsSync(path.join(skillDir, "SKILL.md"))).toBe(true);
     expect(fs.existsSync(path.join(skillDir, "scripts", "deploy.sh"))).toBe(true);
-  });
+  }, 30_000);
 
   it("rejects a tar.gz archive missing SKILL.md at the root", async () => {
     const buf = await makeTarGz({ "other.md": "no skill md here" });

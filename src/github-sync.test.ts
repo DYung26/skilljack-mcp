@@ -39,6 +39,12 @@ describe("syncRepo", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockGitInstance.branchLocal.mockResolvedValue({
+      current: "main",
+      all: ["main"],
+      branches: {},
+    });
+    mockGitInstance.raw.mockResolvedValue("origin/main\n");
     // Suppress console.error during tests
     vi.spyOn(console, "error").mockImplementation(() => {});
   });

@@ -234,7 +234,7 @@ async function syncRepoUnlocked(spec: GitHubRepoSpec, options: SyncOptions): Pro
 
     if (cacheMatchesRef) {
       if (spec.subpath && !fs.existsSync(localPath)) {
-      result.error = `Subpath not found in repository: ${spec.subpath}`;
+        result.error = `Subpath not found in repository: ${spec.subpath}`;
       }
       return result;
     }
@@ -273,7 +273,7 @@ async function syncRepoUnlocked(spec: GitHubRepoSpec, options: SyncOptions): Pro
           const afterHead = await repoGit.revparse(["HEAD"]);
           result.updated = beforeHead !== afterHead;
           if (spec.subpath && !fs.existsSync(localPath)) {
-          result.error = `Subpath not found in repository: ${spec.subpath}`;
+            result.error = `Subpath not found in repository: ${spec.subpath}`;
           }
           return result;
         }
