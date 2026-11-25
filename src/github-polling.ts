@@ -3,8 +3,7 @@
  * Periodically checks for changes and triggers sync when updates are available.
  */
 
-import * as path from "node:path";
-import { GitHubRepoSpec } from "./github-config.js";
+import { GitHubRepoSpec, getRepoClonePath } from "./github-config.js";
 import { tryAcquireFileLockSync } from "./file-lock.js";
 import { SyncOptions, SyncResult, syncRepo, hasRemoteUpdates } from "./github-sync.js";
 
@@ -77,21 +76,18 @@ export function createPollingManager(
       return;
     }
 
-    // One process polls a given Skilljack cache at a time. Other processes
-    // continue serving their cached skills without duplicating remote traffic.
-    const release = tryAcquireFileLockSync(
-      path.join(syncOptions.cacheDir, ".skilljack-github-polling.lock"),
-    );
-    if (!release) {
-      console.error("Polling: Another Skilljack process owns the GitHub polling lease; skipping");
-      return;
-    }
-
     isChecking = true;
     try {
       console.error(`Polling: Checking ${polledSpecs.length} repo(s) for updates...`);
 
       for (const spec of polledSpecs) {
+        const lockPath = getRepoClonePath(spec, syncOptions.cacheDir) + ".skilljack-polling.lock";
+        const release = tryAcquireFileLockSync(lockPath);
+        if (!release) {
+          console.error(`Polling: Another Skilljack process is checking ${spec.owner}/${spec.repo}; skipping this repo`);
+          continue;
+        }
+
         try {
           const hasUpdates = await hasRemoteUpdates(spec, syncOptions);
 
@@ -107,12 +103,12 @@ export function createPollingManager(
           const err = error instanceof Error ? error : new Error(String(error));
           console.error(`Polling: Error checking ${spec.owner}/${spec.repo}: ${err.message}`);
           pollingOptions.onError?.(spec, err);
+        } finally {
+          release();
         }
       }
     } finally {
-      // A throwing callback or unexpected failure must never wedge polling.
       isChecking = false;
-      release();
     }
   }
 

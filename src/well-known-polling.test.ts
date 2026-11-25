@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createWellKnownPollingManager } from "./well-known-polling.js";
 import { syncWellKnown, SyncOptions } from "./well-known-sync.js";
-import { WellKnownSpec } from "./well-known-config.js";
+import { WellKnownSpec, getWellKnownCachePath } from "./well-known-config.js";
 
 const { tryAcquireFileLockSync, withFileLock } = vi.hoisted(() => ({
   tryAcquireFileLockSync: vi.fn(() => vi.fn()),
@@ -81,7 +81,7 @@ describe("createWellKnownPollingManager", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    vi.mocked(tryAcquireFileLockSync).mockReturnValue(vi.fn());
+    vi.mocked(tryAcquireFileLockSync).mockImplementation(() => vi.fn());
     server = await startServer();
     cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "wkpoll-"));
     spec = { origin: server.baseUrl, basePath: "/.well-known/agent-skills" };
@@ -147,7 +147,7 @@ describe("createWellKnownPollingManager", () => {
     await manager.checkNow();
     expect(updateCount).toBe(1);
     expect(updates).toEqual([server.baseUrl]);
-    expect(tryAcquireFileLockSync).toHaveBeenCalledWith(path.join(cacheDir, ".skilljack-well-known-polling.lock"));
+    expect(tryAcquireFileLockSync).toHaveBeenCalledWith(getWellKnownCachePath(spec, cacheDir) + ".skilljack-polling.lock");
   });
 
   it("does not start the timer when interval <= 0", () => {
@@ -208,7 +208,41 @@ describe("createWellKnownPollingManager", () => {
     expect(tryAcquireFileLockSync).toHaveBeenCalledTimes(2);
   });
 
-  it("skips polling while another process owns the shared lease", async () => {
+  it("continues checking other publishers when one polling lock is held", async () => {
+    const secondSpec: WellKnownSpec = {
+      origin: server.baseUrl,
+      basePath: "/other/.well-known/agent-skills",
+    };
+    server.setRoute(
+      "/other/.well-known/agent-skills/index.json",
+      JSON.stringify({ skills: [] }),
+      "application/json",
+    );
+    const release = vi.fn();
+    vi.mocked(tryAcquireFileLockSync)
+      .mockReturnValueOnce(null)
+      .mockReturnValueOnce(release);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const manager = createWellKnownPollingManager([spec, secondSpec], options, {
+      intervalMs: 0,
+      onUpdate: () => {},
+    });
+
+    await manager.checkNow();
+
+    expect(tryAcquireFileLockSync).toHaveBeenNthCalledWith(
+      1,
+      getWellKnownCachePath(spec, cacheDir) + ".skilljack-polling.lock",
+    );
+    expect(tryAcquireFileLockSync).toHaveBeenNthCalledWith(
+      2,
+      getWellKnownCachePath(secondSpec, cacheDir) + ".skilljack-polling.lock",
+    );
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("skips polling while another process owns this publisher lock", async () => {
     vi.mocked(tryAcquireFileLockSync).mockReturnValue(null);
     const manager = createWellKnownPollingManager([spec], options, {
       intervalMs: 0,

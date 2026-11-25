@@ -29,7 +29,7 @@ describe("createPollingManager", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(tryAcquireFileLockSync).mockReturnValue(vi.fn());
+    vi.mocked(tryAcquireFileLockSync).mockImplementation(() => vi.fn());
     vi.useFakeTimers();
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
@@ -81,18 +81,34 @@ describe("createPollingManager", () => {
     expect(manager.isRunning()).toBe(false);
   });
 
-  it("checkNow calls hasRemoteUpdates for each spec while holding the shared lease", async () => {
+  it("checks each repository under its own polling lock", async () => {
     manager = createPollingManager(specs, syncOptions, { intervalMs: 60000, onUpdate });
     await manager.checkNow();
-    expect(tryAcquireFileLockSync).toHaveBeenCalledWith("/cache/.skilljack-github-polling.lock");
+    expect(tryAcquireFileLockSync).toHaveBeenNthCalledWith(1, "/cache/owner1/repo1.skilljack-polling.lock");
+    expect(tryAcquireFileLockSync).toHaveBeenNthCalledWith(2, "/cache/owner2/repo2.skilljack-polling.lock");
     expect(hasRemoteUpdates).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(tryAcquireFileLockSync).mock.results[0].value).toHaveBeenCalledOnce();
+    for (const result of vi.mocked(tryAcquireFileLockSync).mock.results) {
+      expect(result.value).toHaveBeenCalledOnce();
+    }
   });
 
-  it("skips polling when another process owns the shared lease", async () => {
+  it("continues checking other repositories when one polling lock is held", async () => {
+    const release = vi.fn();
+    vi.mocked(tryAcquireFileLockSync)
+      .mockReturnValueOnce(null)
+      .mockReturnValueOnce(release);
+    manager = createPollingManager(specs, syncOptions, { intervalMs: 60000, onUpdate });
+    await manager.checkNow();
+    expect(hasRemoteUpdates).toHaveBeenCalledOnce();
+    expect(hasRemoteUpdates).toHaveBeenCalledWith(specs[1], syncOptions);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("skips repositories whose polling locks are held", async () => {
     vi.mocked(tryAcquireFileLockSync).mockReturnValue(null);
     manager = createPollingManager(specs, syncOptions, { intervalMs: 60000, onUpdate });
     await manager.checkNow();
+    expect(tryAcquireFileLockSync).toHaveBeenCalledTimes(2);
     expect(hasRemoteUpdates).not.toHaveBeenCalled();
   });
 

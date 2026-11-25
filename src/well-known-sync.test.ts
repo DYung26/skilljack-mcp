@@ -12,12 +12,19 @@ import * as zlib from "node:zlib";
 import * as tar from "tar";
 import {
   syncWellKnown,
+  hasRemoteUpdates,
   validateIndexDocument,
   archiveFormatFromUrl,
   IndexEntry,
   SyncOptions,
 } from "./well-known-sync.js";
-import { WellKnownSpec, getWellKnownIndexPath, getWellKnownSkillPath } from "./well-known-config.js";
+import {
+  WellKnownSpec,
+  getWellKnownCachePath,
+  getWellKnownIndexPath,
+  getWellKnownMetaPath,
+  getWellKnownSkillPath,
+} from "./well-known-config.js";
 
 /**
  * SHA-256 of a buffer in `sha256:<hex>` form (matches well-known-sync's format).
@@ -308,6 +315,62 @@ describe("syncWellKnown", () => {
     expect(result.error).toBeUndefined();
     expect(result.updated).toBe(false);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("re-syncs a cache left in progress even when metadata already points at the new index", async () => {
+    const oldBody = makeSkillMd("demo", "A demo skill.", "version one");
+    const oldArtifact = setSkillMd("demo", oldBody);
+    setIndex([
+      { name: "demo", type: "skill-md", description: "demo", url: oldArtifact.url, digest: oldArtifact.digest },
+    ]);
+    await syncWellKnown(spec, options);
+
+    const newBody = makeSkillMd("demo", "A demo skill.", "version two");
+    const newArtifact = setSkillMd("demo", newBody);
+    setIndex([
+      { name: "demo", type: "skill-md", description: "demo", url: newArtifact.url, digest: newArtifact.digest },
+    ]);
+
+    fs.writeFileSync(
+      getWellKnownMetaPath(spec, cacheDir),
+      JSON.stringify({ etag: "new-index", lastModified: null, digest: "sha256:" + "1".repeat(64), fetchedAt: new Date().toISOString() }),
+    );
+    fs.writeFileSync(
+      path.join(getWellKnownCachePath(spec, cacheDir), ".cache-state.json"),
+      JSON.stringify({ status: "syncing" }),
+    );
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const result = await syncWellKnown(spec, { ...options, skipIfExists: true });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.skillsSynced).toEqual(["demo"]);
+    expect(fs.readFileSync(path.join(getWellKnownSkillPath(spec, "demo", cacheDir), "SKILL.md"), "utf-8")).toBe(newBody);
+    expect(JSON.parse(fs.readFileSync(path.join(getWellKnownCachePath(spec, cacheDir), ".cache-state.json"), "utf-8")).status).toBe("complete");
+  });
+
+  it("does not commit index metadata when an artifact fails", async () => {
+    const oldBody = makeSkillMd("demo", "A demo skill.", "version one");
+    const oldArtifact = setSkillMd("demo", oldBody);
+    setIndex([
+      { name: "demo", type: "skill-md", description: "demo", url: oldArtifact.url, digest: oldArtifact.digest },
+    ]);
+    await syncWellKnown(spec, options);
+
+    const metaPath = getWellKnownMetaPath(spec, cacheDir);
+    const previousMeta = fs.readFileSync(metaPath, "utf-8");
+    const brokenBody = makeSkillMd("demo", "A demo skill.", "version two");
+    const brokenArtifact = setSkillMd("demo", brokenBody);
+    setIndex([
+      { name: "demo", type: "skill-md", description: "demo", url: brokenArtifact.url, digest: "sha256:" + "0".repeat(64) },
+    ]);
+
+    const result = await syncWellKnown(spec, options);
+
+    expect(result.skillErrors.demo).toMatch(/Digest mismatch/);
+    expect(fs.readFileSync(metaPath, "utf-8")).toBe(previousMeta);
+    expect(JSON.parse(fs.readFileSync(path.join(getWellKnownCachePath(spec, cacheDir), ".cache-state.json"), "utf-8")).status).toBe("syncing");
+    expect(await hasRemoteUpdates(spec, options)).toBe(true);
   });
 
   it("rejects an entry whose digest does not match the artifact", async () => {

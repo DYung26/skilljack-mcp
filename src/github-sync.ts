@@ -40,6 +40,8 @@ const MAX_RETRIES = 3;
  * Initial backoff delay in milliseconds.
  */
 const INITIAL_BACKOFF_MS = 1000;
+const COMMIT_HASH_RE = /^[0-9a-f]{7,40}$/i;
+const VERSION_TAG_RE = /^v?\d+(?:\.\d+)*(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 /**
  * Sleep for a given number of milliseconds.
@@ -90,14 +92,14 @@ async function cloneWithRetry(
   if (shallowClone) {
     cloneOptions.push("--depth", "1");
   }
-  if (ref) {
+  if (ref && !COMMIT_HASH_RE.test(ref)) {
     cloneOptions.push("--branch", ref);
   }
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       await git.clone(url, destPath, cloneOptions);
-      return;
+      break;
     } catch (error) {
       const isLastAttempt = attempt === MAX_RETRIES - 1;
       if (isLastAttempt) {
@@ -108,6 +110,12 @@ async function cloneWithRetry(
       console.error(`Clone attempt ${attempt + 1}/${MAX_RETRIES} failed, retrying in ${backoff}ms...`);
       await sleep(backoff);
     }
+  }
+
+  if (ref && COMMIT_HASH_RE.test(ref)) {
+    const repoGit = simpleGit(destPath);
+    await repoGit.fetch(["origin", ref]);
+    await repoGit.checkout(ref);
   }
 }
 
@@ -147,6 +155,56 @@ async function pullWithRetry(git: SimpleGit, ref: string | undefined): Promise<b
   return false;
 }
 
+async function getDefaultBranch(git: SimpleGit): Promise<string | undefined> {
+  try {
+    const remoteHead = (
+      await git.raw(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    ).trim();
+    if (remoteHead) {
+      return remoteHead.startsWith("origin/")
+        ? remoteHead.slice("origin/".length)
+        : remoteHead;
+    }
+  } catch {
+    // Fall back to conventional default branch names when origin/HEAD is unset.
+  }
+
+  for (const branch of ["main", "master"]) {
+    try {
+      await git.revparse(["refs/remotes/origin/" + branch]);
+      return branch;
+    } catch {
+      continue;
+    }
+  }
+
+  return undefined;
+}
+
+async function isCachedRefCurrent(spec: GitHubRepoSpec, git: SimpleGit): Promise<boolean> {
+  if (!spec.ref) {
+    const defaultBranch = await getDefaultBranch(git);
+    return defaultBranch !== undefined && (await git.branchLocal()).current === defaultBranch;
+  }
+
+  const tags = await git.tags();
+  if (tags.all.includes(spec.ref)) {
+    const [head, tagHead] = await Promise.all([
+      git.revparse(["HEAD"]),
+      git.revparse([spec.ref + "^{commit}"]),
+    ]);
+    return head === tagHead;
+  }
+
+  if (COMMIT_HASH_RE.test(spec.ref)) {
+    const head = (await git.revparse(["HEAD"])).toLowerCase();
+    return head.startsWith(spec.ref.toLowerCase());
+  }
+
+  if (VERSION_TAG_RE.test(spec.ref)) return false;
+  return (await git.branchLocal()).current === spec.ref;
+}
+
 /**
  * Sync a single GitHub repository.
  * Clones if not present, pulls if already cloned.
@@ -168,10 +226,18 @@ async function syncRepoUnlocked(spec: GitHubRepoSpec, options: SyncOptions): Pro
   };
 
   if (options.skipIfExists && isGitRepo(clonePath)) {
-    if (spec.subpath && !fs.existsSync(localPath)) {
-      result.error = `Subpath "${spec.subpath}" not found in repository`;
+    const repoGit = simpleGit(clonePath);
+    const cacheMatchesRef = await isCachedRefCurrent(spec, repoGit).catch((error) => {
+      console.error(`Could not verify cached ref for ${spec.owner}/${spec.repo}: ${error}`);
+      return false;
+    });
+
+    if (cacheMatchesRef) {
+      if (spec.subpath && !fs.existsSync(localPath)) {
+      result.error = `Subpath not found in repository: ${spec.subpath}`;
+      }
+      return result;
     }
-    return result;
   }
 
   try {
@@ -190,22 +256,36 @@ async function syncRepoUnlocked(spec: GitHubRepoSpec, options: SyncOptions): Pro
       console.error(`Pulling updates for ${spec.owner}/${spec.repo}...`);
       const repoGit = simpleGit(clonePath);
 
-      // For pinned refs (tags/commits), we don't pull updates
-      if (spec.ref && !spec.ref.includes("/")) {
-        // Check if this looks like a tag or commit hash
-        const isTag = await repoGit
-          .tags()
-          .then((tags: TagResult) => tags.all.includes(spec.ref!))
-          .catch(() => false);
-        const isCommit = /^[0-9a-f]{7,40}$/i.test(spec.ref);
+      if (spec.ref) {
+        const tags = await repoGit.tags();
+        const isTag = tags.all.includes(spec.ref);
+        const isCommit = COMMIT_HASH_RE.test(spec.ref);
+        const isVersionTag = VERSION_TAG_RE.test(spec.ref);
 
-        if (isTag || isCommit) {
-          console.error(`Skipping pull for pinned ref: ${spec.ref}`);
+        if (isTag || isCommit || isVersionTag) {
+          const beforeHead = await repoGit.revparse(["HEAD"]);
+          if (isCommit) {
+            await repoGit.fetch(["origin", spec.ref]);
+          } else if (!isTag) {
+            await repoGit.fetch(["origin", "refs/tags/" + spec.ref + ":refs/tags/" + spec.ref]);
+          }
+          await repoGit.checkout(spec.ref);
+          const afterHead = await repoGit.revparse(["HEAD"]);
+          result.updated = beforeHead !== afterHead;
+          if (spec.subpath && !fs.existsSync(localPath)) {
+          result.error = `Subpath not found in repository: ${spec.subpath}`;
+          }
           return result;
         }
       }
 
-      result.updated = await pullWithRetry(repoGit, spec.ref);
+      const currentBranch = (await repoGit.branchLocal()).current;
+      const defaultBranch = spec.ref ? undefined : await getDefaultBranch(repoGit);
+      const targetRef = spec.ref ?? defaultBranch ?? currentBranch;
+      if (!targetRef) {
+        throw new Error(`Could not determine the default branch for ${spec.owner}/${spec.repo}`);
+      }
+      result.updated = await pullWithRetry(repoGit, targetRef);
       if (result.updated) {
         console.error(`Updated ${spec.owner}/${spec.repo}`);
       } else {
@@ -215,7 +295,7 @@ async function syncRepoUnlocked(spec: GitHubRepoSpec, options: SyncOptions): Pro
 
     // Verify the subpath exists if specified
     if (spec.subpath && !fs.existsSync(localPath)) {
-      result.error = `Subpath "${spec.subpath}" not found in repository`;
+      result.error = `Subpath not found in repository: ${spec.subpath}`;
       console.error(`Warning: ${result.error}`);
     }
   } catch (error) {

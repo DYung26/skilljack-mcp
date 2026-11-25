@@ -6,8 +6,7 @@
  * shape as github-polling.ts so the wiring in index.ts is symmetrical.
  */
 
-import * as path from "node:path";
-import { WellKnownSpec } from "./well-known-config.js";
+import { WellKnownSpec, getWellKnownCachePath } from "./well-known-config.js";
 import { tryAcquireFileLockSync } from "./file-lock.js";
 import { SyncOptions, SyncResult, hasRemoteUpdates, syncWellKnown } from "./well-known-sync.js";
 
@@ -39,21 +38,18 @@ export function createWellKnownPollingManager(
     }
     if (specs.length === 0) return;
 
-    // One process polls a given Skilljack cache at a time. This lease is
-    // separate from GitHub polling so both source types make progress.
-    const release = tryAcquireFileLockSync(
-      path.join(syncOptions.cacheDir, ".skilljack-well-known-polling.lock"),
-    );
-    if (!release) {
-      console.error("Well-known polling: another Skilljack process owns the polling lease; skipping");
-      return;
-    }
-
     isChecking = true;
     try {
       console.error(`Well-known polling: checking ${specs.length} publisher(s) for updates...`);
 
       for (const spec of specs) {
+        const lockPath = getWellKnownCachePath(spec, syncOptions.cacheDir) + ".skilljack-polling.lock";
+        const release = tryAcquireFileLockSync(lockPath);
+        if (!release) {
+          console.error(`Well-known polling: another process is checking ${spec.origin}; skipping this publisher`);
+          continue;
+        }
+
         try {
           const hasUpdates = await hasRemoteUpdates(spec, syncOptions);
           if (!hasUpdates) continue;
@@ -65,15 +61,14 @@ export function createWellKnownPollingManager(
           }
         } catch (error) {
           const err = error instanceof Error ? error : new Error(String(error));
-          console.error(
-            `Well-known polling: error checking ${spec.origin}: ${err.message}`
-          );
+          console.error(`Well-known polling: error checking ${spec.origin}: ${err.message}`);
           pollingOptions.onError?.(spec, err);
+        } finally {
+          release();
         }
       }
     } finally {
       isChecking = false;
-      release();
     }
   }
 
