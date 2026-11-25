@@ -737,6 +737,9 @@ async function main() {
         cacheDir: githubConfig.cacheDir,
         token: githubConfig.token,
         shallowClone: true,
+        // Other Skilljack processes share this cache. Once one has populated
+        // it, later startups should reuse it instead of repeating network syncs.
+        skipIfExists: true,
       };
 
       const results = await syncAllRepos(currentGithubSpecs, syncOptions);
@@ -780,6 +783,7 @@ async function main() {
         maxUnpackedBytes: wellKnownConfig.maxUnpackedBytes,
         allowedOrigins: wellKnownConfig.allowedOrigins,
         allowHttp: wellKnownConfig.allowHttp,
+        skipIfExists: true,
       };
 
       const wkResults = await syncAllWellKnown(currentWellKnownSpecs, wkSyncOptions);

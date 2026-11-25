@@ -24,6 +24,7 @@ import {
   getWellKnownSkillPath,
   resolveArtifactUrl,
 } from "./well-known-config.js";
+import { withFileLock } from "./file-lock.js";
 
 /**
  * One entry in the publisher's discovery index.
@@ -44,6 +45,11 @@ export interface IndexDocument {
   skills: IndexEntry[];
 }
 
+interface CompleteCacheState {
+  status: "complete";
+  indexDigest: string;
+}
+
 /**
  * Options for sync operations.
  */
@@ -59,6 +65,8 @@ export interface SyncOptions {
   allowedOrigins: string[];
   /** Permit http:// (dev only); otherwise only https:// is fetched. */
   allowHttp: boolean;
+  /** Skip network work when a valid cached index already exists (startup only). */
+  skipIfExists?: boolean;
 }
 
 /**
@@ -83,6 +91,7 @@ export interface SyncResult {
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_REDIRECTS = 5;
+const CACHE_STATE_FILE = ".cache-state.json";
 
 /**
  * Allowed digest format: sha256:<64 lowercase hex chars>.
@@ -522,6 +531,42 @@ function loadCachedIndex(spec: WellKnownSpec, cacheDir: string): IndexDocument |
   }
 }
 
+function loadCompleteCacheState(
+  spec: WellKnownSpec,
+  cacheDir: string,
+): CompleteCacheState | null {
+  const statePath = path.join(getWellKnownCachePath(spec, cacheDir), CACHE_STATE_FILE);
+  if (!fs.existsSync(statePath)) return null;
+
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      !("status" in parsed) ||
+      parsed.status !== "complete" ||
+      !("indexDigest" in parsed) ||
+      typeof parsed.indexDigest !== "string"
+    ) {
+      return null;
+    }
+    return { status: "complete", indexDigest: parsed.indexDigest };
+  } catch {
+    return null;
+  }
+}
+
+function areCachedArtifactsPresent(
+  spec: WellKnownSpec,
+  cacheDir: string,
+  indexDoc: IndexDocument,
+): boolean {
+  return indexDoc.skills.every((entry) =>
+    (entry.type !== "skill-md" && entry.type !== "archive") ||
+    fs.existsSync(path.join(getWellKnownSkillPath(spec, entry.name, cacheDir), "SKILL.md")),
+  );
+}
+
 /**
  * Sync a single well-known publisher.
  *
@@ -532,11 +577,11 @@ function loadCachedIndex(spec: WellKnownSpec, cacheDir: string): IndexDocument |
  *        - if cached digest matches and on-disk artifact exists → skip
  *        - else fetch artifact, verify digest, write/extract atomically
  *   4. Prune skill subdirectories that are no longer in the index.
- *   5. Atomically replace the cached index.json.
+ *   5. Replace the index and metadata, then mark the cache complete.
  */
-export async function syncWellKnown(
+async function syncWellKnownUnlocked(
   spec: WellKnownSpec,
-  options: SyncOptions
+  options: SyncOptions,
 ): Promise<SyncResult> {
   const cachePath = getWellKnownCachePath(spec, options.cacheDir);
   const skillsRoot = path.join(cachePath, "skills");
@@ -552,11 +597,39 @@ export async function syncWellKnown(
   ensureDir(cachePath);
   ensureDir(skillsRoot);
 
+  if (options.skipIfExists) {
+    const cachedIndex = loadCachedIndex(spec, options.cacheDir);
+    const cacheState = loadCompleteCacheState(spec, options.cacheDir);
+    const indexPath = getWellKnownIndexPath(spec, options.cacheDir);
+    const cachedIndexDigest = fs.existsSync(indexPath)
+      ? sha256Digest(fs.readFileSync(indexPath))
+      : null;
+    const cacheIsComplete = cachedIndex
+      ? areCachedArtifactsPresent(spec, options.cacheDir, cachedIndex)
+      : false;
+    const hasCachedMeta = fs.existsSync(getWellKnownMetaPath(spec, options.cacheDir));
+
+    if (
+      cachedIndex &&
+      cacheIsComplete &&
+      cacheState?.indexDigest === cachedIndexDigest &&
+      hasCachedMeta
+    ) {
+      return result;
+    }
+  }
+
   // Re-validate every URL we fetch (index, artifacts, redirect targets) against
   // the allowlist and scheme rules — not just the configured index origin.
   const validate = (u: string) => assertUrlAllowed(u, options);
 
   let indexDoc: IndexDocument;
+  let indexMeta: {
+    etag: string | null;
+    lastModified: string | null;
+    digest: string;
+    fetchedAt: string;
+  };
   try {
     const indexUrl = getWellKnownIndexUrl(spec);
     validate(indexUrl);
@@ -570,20 +643,21 @@ export async function syncWellKnown(
     const parsed = JSON.parse(text);
     indexDoc = validateIndexDocument(parsed);
 
-    // Persist conditional-fetch hints for later HEAD probes.
-    const meta = {
+    indexMeta = {
       etag: response.headers.get("etag") || null,
       lastModified: response.headers.get("last-modified") || null,
       digest: sha256Digest(response.body),
       fetchedAt: new Date().toISOString(),
     };
-    writeFileAtomic(getWellKnownMetaPath(spec, options.cacheDir), JSON.stringify(meta, null, 2));
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     result.error = `Failed to fetch index for ${spec.origin}: ${msg}`;
     console.error(result.error);
     return result;
   }
+
+  const cacheStatePath = path.join(cachePath, CACHE_STATE_FILE);
+  writeFileAtomic(cacheStatePath, JSON.stringify({ status: "syncing" }, null, 2));
 
   const cached = loadCachedIndex(spec, options.cacheDir);
   const cachedByName = new Map<string, IndexEntry>();
@@ -673,14 +747,38 @@ export async function syncWellKnown(
     }
   }
 
-  // Persist the new index last so a crash mid-sync leaves the old index in
-  // place (digest comparison on the next run will redo any incomplete work).
-  writeFileAtomic(
-    getWellKnownIndexPath(spec, options.cacheDir),
-    JSON.stringify(indexDoc, null, 2)
-  );
+  // Commit the index and conditional-fetch metadata only after artifact writes.
+  // The syncing marker remains on disk if any step fails, forcing a full retry.
+  const serializedIndex = JSON.stringify(indexDoc, null, 2);
+  writeFileAtomic(getWellKnownIndexPath(spec, options.cacheDir), serializedIndex);
+
+  if (Object.keys(result.skillErrors).length === 0) {
+    writeFileAtomic(
+      getWellKnownMetaPath(spec, options.cacheDir),
+      JSON.stringify(indexMeta, null, 2),
+    );
+    const completeState: CompleteCacheState = {
+      status: "complete",
+      indexDigest: sha256Digest(Buffer.from(serializedIndex, "utf-8")),
+    };
+    writeFileAtomic(cacheStatePath, JSON.stringify(completeState, null, 2));
+  }
 
   return result;
+}
+
+/**
+ * Sync one publisher while holding its cache lock. This protects the index,
+ * metadata, and skill directories from concurrent process writes.
+ */
+export async function syncWellKnown(
+  spec: WellKnownSpec,
+  options: SyncOptions,
+): Promise<SyncResult> {
+  const cachePath = getWellKnownCachePath(spec, options.cacheDir);
+  return withFileLock(`${cachePath}.skilljack-lock`, () =>
+    syncWellKnownUnlocked(spec, options),
+  );
 }
 
 /**
@@ -707,10 +805,28 @@ export async function syncAllWellKnown(
  *
  * This avoids hashing on the publisher's side and keeps bandwidth low.
  */
-export async function hasRemoteUpdates(
+async function hasRemoteUpdatesUnlocked(
   spec: WellKnownSpec,
-  options: SyncOptions
+  options: SyncOptions,
 ): Promise<boolean> {
+  const indexPath = getWellKnownIndexPath(spec, options.cacheDir);
+  const cacheState = loadCompleteCacheState(spec, options.cacheDir);
+  const cachedIndex = loadCachedIndex(spec, options.cacheDir);
+  if (
+    !cacheState ||
+    !cachedIndex ||
+    !areCachedArtifactsPresent(spec, options.cacheDir, cachedIndex) ||
+    !fs.existsSync(indexPath)
+  ) {
+    return true;
+  }
+
+  try {
+    if (cacheState.indexDigest !== sha256Digest(fs.readFileSync(indexPath))) return true;
+  } catch {
+    return true;
+  }
+
   const metaPath = getWellKnownMetaPath(spec, options.cacheDir);
   if (!fs.existsSync(metaPath)) return true;
 
@@ -747,4 +863,15 @@ export async function hasRemoteUpdates(
     );
     return false;
   }
+}
+
+/** Serialize update checks with syncs for this publisher. */
+export async function hasRemoteUpdates(
+  spec: WellKnownSpec,
+  options: SyncOptions,
+): Promise<boolean> {
+  const cachePath = getWellKnownCachePath(spec, options.cacheDir);
+  return withFileLock(`${cachePath}.skilljack-lock`, () =>
+    hasRemoteUpdatesUnlocked(spec, options),
+  );
 }

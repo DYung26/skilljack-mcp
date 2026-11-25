@@ -11,7 +11,13 @@ const mockGitInstance = {
   checkout: vi.fn().mockResolvedValue(undefined),
   revparse: vi.fn().mockResolvedValue("abc123"),
   tags: vi.fn().mockResolvedValue({ all: [] }),
+  branchLocal: vi.fn().mockResolvedValue({ current: "main", all: ["main"], branches: {} }),
+  raw: vi.fn().mockResolvedValue("origin/main\n"),
 };
+
+vi.mock("./file-lock.js", () => ({
+  withFileLock: async (_lockPath: string, operation: () => Promise<unknown>) => operation(),
+}));
 
 vi.mock("simple-git", () => ({
   simpleGit: vi.fn(() => mockGitInstance),
@@ -33,6 +39,12 @@ describe("syncRepo", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockGitInstance.branchLocal.mockResolvedValue({
+      current: "main",
+      all: ["main"],
+      branches: {},
+    });
+    mockGitInstance.raw.mockResolvedValue("origin/main\n");
     // Suppress console.error during tests
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
@@ -50,6 +62,17 @@ describe("syncRepo", () => {
       expect.any(String),
       expect.arrayContaining(["--depth", "1"])
     );
+  });
+
+  it("reuses an existing cache during startup without pulling", async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith(".git"));
+
+    const result = await syncRepo(spec, { ...options, skipIfExists: true });
+
+    expect(result.updated).toBe(false);
+    expect(result.error).toBeUndefined();
+    expect(mockGitInstance.clone).not.toHaveBeenCalled();
+    expect(mockGitInstance.pull).not.toHaveBeenCalled();
   });
 
   it("pulls when repo already exists", async () => {
@@ -84,6 +107,8 @@ describe("syncRepo", () => {
     const result = await syncRepo(pinnedSpec, options);
 
     expect(result.updated).toBe(false);
+    expect(mockGitInstance.fetch).toHaveBeenCalledWith(["origin", "abc1234"]);
+    expect(mockGitInstance.checkout).toHaveBeenCalledWith("abc1234");
     expect(mockGitInstance.pull).not.toHaveBeenCalled();
   });
 
@@ -103,6 +128,62 @@ describe("syncRepo", () => {
     const result = await syncRepo(tagSpec, options);
 
     expect(result.updated).toBe(false);
+    expect(mockGitInstance.checkout).toHaveBeenCalledWith("v1.0.0");
+    expect(mockGitInstance.pull).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse an existing cache when the configured branch differs", async () => {
+    const branchSpec: GitHubRepoSpec = {
+      owner: "test-owner",
+      repo: "test-repo",
+      ref: "release",
+    };
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith(".git"));
+    mockGitInstance.branchLocal.mockResolvedValue({ current: "main", all: ["main"], branches: {} });
+    mockGitInstance.tags.mockResolvedValue({ all: [] });
+
+    await syncRepo(branchSpec, { ...options, skipIfExists: true });
+
+    expect(mockGitInstance.fetch).toHaveBeenCalledWith(["origin", "release"]);
+    expect(mockGitInstance.checkout).toHaveBeenCalledWith("release");
+    expect(mockGitInstance.pull).toHaveBeenCalledWith("origin", "release", ["--ff-only"]);
+  });
+
+  it("reuses a cache when the configured tag already matches HEAD", async () => {
+    const tagSpec: GitHubRepoSpec = {
+      owner: "test-owner",
+      repo: "test-repo",
+      ref: "v1.0.0",
+    };
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith(".git"));
+    mockGitInstance.tags.mockResolvedValue({ all: ["v1.0.0"] });
+    mockGitInstance.revparse.mockResolvedValue("tag-head");
+
+    const result = await syncRepo(tagSpec, { ...options, skipIfExists: true });
+
+    expect(result.updated).toBe(false);
+    expect(mockGitInstance.fetch).not.toHaveBeenCalled();
+    expect(mockGitInstance.checkout).not.toHaveBeenCalled();
+  });
+
+  it("checks out the configured tag when the cached tag differs", async () => {
+    const tagSpec: GitHubRepoSpec = {
+      owner: "test-owner",
+      repo: "test-repo",
+      ref: "v2.0.0",
+    };
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith(".git"));
+    mockGitInstance.tags.mockResolvedValue({ all: ["v1.0.0", "v2.0.0"] });
+    mockGitInstance.revparse
+      .mockResolvedValueOnce("old-head")
+      .mockResolvedValueOnce("new-tag-head")
+      .mockResolvedValueOnce("old-head")
+      .mockResolvedValueOnce("new-tag-head");
+
+    const result = await syncRepo(tagSpec, { ...options, skipIfExists: true });
+
+    expect(result.updated).toBe(true);
+    expect(mockGitInstance.checkout).toHaveBeenCalledWith("v2.0.0");
     expect(mockGitInstance.pull).not.toHaveBeenCalled();
   });
 

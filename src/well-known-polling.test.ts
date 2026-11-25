@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -6,7 +6,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createWellKnownPollingManager } from "./well-known-polling.js";
 import { syncWellKnown, SyncOptions } from "./well-known-sync.js";
-import { WellKnownSpec } from "./well-known-config.js";
+import { WellKnownSpec, getWellKnownCachePath } from "./well-known-config.js";
+
+const { tryAcquireFileLockSync, withFileLock } = vi.hoisted(() => ({
+  tryAcquireFileLockSync: vi.fn(() => vi.fn()),
+  withFileLock: async (_lockPath: string, operation: () => Promise<unknown>) => operation(),
+}));
+
+vi.mock("./file-lock.js", () => ({ tryAcquireFileLockSync, withFileLock }));
 
 function digestOf(s: string): string {
   return "sha256:" + crypto.createHash("sha256").update(s).digest("hex");
@@ -60,7 +67,7 @@ async function startServer(): Promise<FixtureServer> {
     },
     async close() {
       await new Promise<void>((resolve, reject) =>
-        server.close((err) => (err ? reject(err) : resolve()))
+        server.close((err) => (err ? reject(err) : resolve())),
       );
     },
   };
@@ -73,6 +80,8 @@ describe("createWellKnownPollingManager", () => {
   let options: SyncOptions;
 
   beforeEach(async () => {
+    vi.clearAllMocks();
+    vi.mocked(tryAcquireFileLockSync).mockImplementation(() => vi.fn());
     server = await startServer();
     cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "wkpoll-"));
     spec = { origin: server.baseUrl, basePath: "/.well-known/agent-skills" };
@@ -88,66 +97,57 @@ describe("createWellKnownPollingManager", () => {
   afterEach(async () => {
     fs.rmSync(cacheDir, { recursive: true, force: true });
     await server.close();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("calls onUpdate when the index changes", async () => {
-    // Initial state.
     const aBody = skillBody("alpha", "1");
     server.setRoute("/.well-known/agent-skills/alpha/SKILL.md", aBody);
-    server.setIndex(
-      JSON.stringify({
-        $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
-        skills: [
-          {
-            name: "alpha",
-            type: "skill-md",
-            description: "a",
-            url: "/.well-known/agent-skills/alpha/SKILL.md",
-            digest: digestOf(aBody),
-          },
-        ],
-      })
-    );
+    server.setIndex(JSON.stringify({
+      $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+      skills: [{
+        name: "alpha",
+        type: "skill-md",
+        description: "a",
+        url: "/.well-known/agent-skills/alpha/SKILL.md",
+        digest: digestOf(aBody),
+      }],
+    }));
 
-    // Prime the cache.
     const first = await syncWellKnown(spec, options);
     expect(first.skillsSynced).toEqual(["alpha"]);
 
     let updateCount = 0;
     const updates: string[] = [];
     const manager = createWellKnownPollingManager([spec], options, {
-      intervalMs: 0, // We'll trigger checkNow manually
+      intervalMs: 0,
       onUpdate: (s) => {
         updateCount += 1;
         updates.push(s.origin);
       },
     });
 
-    // No change → no update.
     await manager.checkNow();
     expect(updateCount).toBe(0);
 
-    // Change the published artifact (and thus the index digest).
     const aBody2 = skillBody("alpha", "2");
     server.setRoute("/.well-known/agent-skills/alpha/SKILL.md", aBody2);
-    server.setIndex(
-      JSON.stringify({
-        $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
-        skills: [
-          {
-            name: "alpha",
-            type: "skill-md",
-            description: "a",
-            url: "/.well-known/agent-skills/alpha/SKILL.md",
-            digest: digestOf(aBody2),
-          },
-        ],
-      })
-    );
+    server.setIndex(JSON.stringify({
+      $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+      skills: [{
+        name: "alpha",
+        type: "skill-md",
+        description: "a",
+        url: "/.well-known/agent-skills/alpha/SKILL.md",
+        digest: digestOf(aBody2),
+      }],
+    }));
 
     await manager.checkNow();
     expect(updateCount).toBe(1);
     expect(updates).toEqual([server.baseUrl]);
+    expect(tryAcquireFileLockSync).toHaveBeenCalledWith(getWellKnownCachePath(spec, cacheDir) + ".skilljack-polling.lock");
   });
 
   it("does not start the timer when interval <= 0", () => {
@@ -166,5 +166,93 @@ describe("createWellKnownPollingManager", () => {
     });
     manager.start();
     expect(manager.isRunning()).toBe(false);
+  });
+
+  it("releases the lease and recovers its guard when an error callback throws", async () => {
+    const body = skillBody("alpha", "1");
+    server.setRoute("/.well-known/agent-skills/alpha/SKILL.md", body);
+    server.setIndex(JSON.stringify({
+      $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+      skills: [{ name: "alpha", type: "skill-md", description: "a", url: "/.well-known/agent-skills/alpha/SKILL.md", digest: digestOf(body) }],
+    }));
+    await syncWellKnown(spec, options);
+
+    const updatedBody = skillBody("alpha", "2");
+    server.setRoute("/.well-known/agent-skills/alpha/SKILL.md", updatedBody);
+    server.setIndex(JSON.stringify({
+      $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+      skills: [{ name: "alpha", type: "skill-md", description: "a", url: "/.well-known/agent-skills/alpha/SKILL.md", digest: digestOf(updatedBody) }],
+    }));
+
+    let throwUpdateOnce = true;
+    let throwErrorOnce = true;
+    const manager = createWellKnownPollingManager([spec], options, {
+      intervalMs: 0,
+      onUpdate: () => {
+        if (throwUpdateOnce) {
+          throwUpdateOnce = false;
+          throw new Error("update callback failed");
+        }
+      },
+      onError: () => {
+        if (throwErrorOnce) {
+          throwErrorOnce = false;
+          throw new Error("error callback failed");
+        }
+      },
+    });
+
+    await expect(manager.checkNow()).rejects.toThrow("error callback failed");
+    expect(vi.mocked(tryAcquireFileLockSync).mock.results[0].value).toHaveBeenCalledOnce();
+    await manager.checkNow();
+    expect(tryAcquireFileLockSync).toHaveBeenCalledTimes(2);
+  });
+
+  it("continues checking other publishers when one polling lock is held", async () => {
+    const secondSpec: WellKnownSpec = {
+      origin: server.baseUrl,
+      basePath: "/other/.well-known/agent-skills",
+    };
+    server.setRoute(
+      "/other/.well-known/agent-skills/index.json",
+      JSON.stringify({ skills: [] }),
+      "application/json",
+    );
+    const release = vi.fn();
+    vi.mocked(tryAcquireFileLockSync)
+      .mockReturnValueOnce(null)
+      .mockReturnValueOnce(release);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const manager = createWellKnownPollingManager([spec, secondSpec], options, {
+      intervalMs: 0,
+      onUpdate: () => {},
+    });
+
+    await manager.checkNow();
+
+    expect(tryAcquireFileLockSync).toHaveBeenNthCalledWith(
+      1,
+      getWellKnownCachePath(spec, cacheDir) + ".skilljack-polling.lock",
+    );
+    expect(tryAcquireFileLockSync).toHaveBeenNthCalledWith(
+      2,
+      getWellKnownCachePath(secondSpec, cacheDir) + ".skilljack-polling.lock",
+    );
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("skips polling while another process owns this publisher lock", async () => {
+    vi.mocked(tryAcquireFileLockSync).mockReturnValue(null);
+    const manager = createWellKnownPollingManager([spec], options, {
+      intervalMs: 0,
+      onUpdate: () => {},
+    });
+    await manager.checkNow();
+    expect(tryAcquireFileLockSync).toHaveBeenCalledOnce();
+    expect(vi.mocked(tryAcquireFileLockSync).mock.results[0].value).toBeNull();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    await manager.checkNow();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
